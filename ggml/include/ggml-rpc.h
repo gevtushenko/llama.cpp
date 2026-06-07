@@ -24,8 +24,12 @@ GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_rpc_buffer_type(const c
 
 GGML_BACKEND_API void ggml_backend_rpc_get_device_memory(const char * endpoint, uint32_t device, size_t * free, size_t * total);
 
+// dev_mem_caps is an optional array of length n_devices specifying a per-device
+// cap (in bytes) on the free/total memory reported to clients. A cap of 0 means
+// "no cap" for that device. Pass nullptr to disable capping entirely.
 GGML_BACKEND_API void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir,
-                                                    size_t n_threads, size_t n_devices, ggml_backend_dev_t * devices);
+                                                    size_t n_threads, size_t n_devices, ggml_backend_dev_t * devices,
+                                                    const size_t * dev_mem_caps);
 
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_rpc_reg(void);
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_rpc_add_server(const char * endpoint);
