@@ -1557,8 +1557,9 @@ static bool rpc_check_node(const ggml_tensor * node) {
 
 class rpc_server {
 public:
-    rpc_server(std::vector<ggml_backend_t> all_backends, const char * cache_dir)
-        : backends(std::move(all_backends)), cache_dir(cache_dir) {
+    rpc_server(std::vector<ggml_backend_t> all_backends, const char * cache_dir,
+               std::vector<size_t> dev_mem_caps = {})
+        : backends(std::move(all_backends)), cache_dir(cache_dir), dev_mem_caps(std::move(dev_mem_caps)) {
         stored_graphs.resize(backends.size());
         comm_states.resize(backends.size());
         ggml_init_params params {
@@ -1649,6 +1650,8 @@ private:
     // SET_TENSOR data is received in chunks through this buffer
     std::vector<uint8_t> set_tensor_buf;
     ggml_context_ptr req_ctx;
+    // optional per-device cap (bytes) on reported free/total memory; 0 = uncapped
+    std::vector<size_t> dev_mem_caps;
 };
 
 void rpc_server::hello(rpc_msg_hello_rsp & response) {
@@ -2541,6 +2544,11 @@ bool rpc_server::get_device_memory(const rpc_msg_get_device_memory_req & request
     size_t free, total;
     ggml_backend_dev_t dev = ggml_backend_get_device(backends[dev_id]);
     ggml_backend_dev_memory(dev, &free, &total);
+    if (dev_id < dev_mem_caps.size() && dev_mem_caps[dev_id] > 0) {
+        const size_t cap = dev_mem_caps[dev_id];
+        free  = std::min(free,  cap);
+        total = std::min(total, cap);
+    }
     response.free_mem = free;
     response.total_mem = total;
     LOG_DBG2("[%s] device: %u, free: %s, total: %s\n", __func__, dev_id,
@@ -2589,8 +2597,8 @@ static bool rpc_serve(const socket_ptr & sock, rpc_server & server, handler_t ha
 }
 
 static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const char * cache_dir,
-                             socket_ptr sock) {
-    rpc_server server(backends, cache_dir);
+                             socket_ptr sock, const std::vector<size_t> & dev_mem_caps) {
+    rpc_server server(backends, cache_dir, dev_mem_caps);
     uint8_t cmd;
     if (!sock->recv_data(&cmd, 1)) {
         return;
@@ -2690,12 +2698,17 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
 }
 
 void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir,
-                                   size_t n_threads, size_t n_devices, ggml_backend_dev_t * devices) {
+                                   size_t n_threads, size_t n_devices, ggml_backend_dev_t * devices,
+                                   const size_t * dev_mem_caps) {
     if (n_devices == 0 || devices == nullptr) {
         LOG_ERROR("Invalid arguments to ggml_backend_rpc_start_server\n");
         return;
     }
     std::vector<ggml_backend_t> backends;
+    std::vector<size_t> dev_mem_caps_vec;
+    if (dev_mem_caps != nullptr) {
+        dev_mem_caps_vec.assign(dev_mem_caps, dev_mem_caps + n_devices);
+    }
     LOG_INFO("Starting RPC server v%d.%d.%d\n",
         RPC_PROTO_MAJOR_VERSION,
         RPC_PROTO_MINOR_VERSION,
@@ -2707,8 +2720,18 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
         auto dev = devices[i];
         size_t free, total;
         ggml_backend_dev_memory(dev, &free, &total);
-        LOG_INFO("  %s: %s (%zu MiB, %zu MiB free)\n", ggml_backend_dev_name(dev), ggml_backend_dev_description(dev),
-                 total / 1024 / 1024, free / 1024 / 1024);
+        const size_t cap = (i < dev_mem_caps_vec.size()) ? dev_mem_caps_vec[i] : 0;
+        if (cap > 0) {
+            const size_t capped_free  = std::min(free,  cap);
+            const size_t capped_total = std::min(total, cap);
+            LOG_INFO("  %s: %s (%zu MiB, %zu MiB free, capped from %zu MiB / %zu MiB)\n",
+                     ggml_backend_dev_name(dev), ggml_backend_dev_description(dev),
+                     capped_total / 1024 / 1024, capped_free / 1024 / 1024,
+                     total / 1024 / 1024, free / 1024 / 1024);
+        } else {
+            LOG_INFO("  %s: %s (%zu MiB, %zu MiB free)\n", ggml_backend_dev_name(dev), ggml_backend_dev_description(dev),
+                     total / 1024 / 1024, free / 1024 / 1024);
+        }
         auto backend = ggml_backend_dev_init(dev, nullptr);
         if (!backend) {
             LOG_ERROR("Failed to create backend for device %s\n", dev->iface.get_name(dev));
@@ -2751,7 +2774,7 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
             return;
         }
         LOG_INFO("Accepted client connection\n");
-        rpc_serve_client(backends, cache_dir, client_socket);
+        rpc_serve_client(backends, cache_dir, client_socket, dev_mem_caps_vec);
         LOG_INFO("Client connection closed\n");
     }
     rpc_transport_shutdown();
