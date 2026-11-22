@@ -504,6 +504,28 @@ llama_context::llama_context(
             }
         }
 
+        // weights can be on a device that computes nothing (e.g. host memory of an RPC server)
+        for (const auto & [buft, size] : model.memory_breakdown()) {
+            ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+            if (dev == nullptr || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_ACCEL) {
+                continue;
+            }
+            const bool found = std::any_of(backends.begin(), backends.end(),
+                    [&](const ggml_backend_ptr & backend) { return ggml_backend_get_device(backend.get()) == dev; });
+            if (found) {
+                continue;
+            }
+            // the scheduler has a limit, the CPU backend is added below
+            if (backends.size() + 2 > llama_max_devices()) {
+                throw std::runtime_error(format("too many backends, cannot add %s", ggml_backend_dev_name(dev)));
+            }
+            ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
+            if (backend == nullptr) {
+                throw std::runtime_error(format("failed to initialize %s backend", ggml_backend_dev_name(dev)));
+            }
+            backends.emplace_back(backend);
+        }
+
         // add CPU backend
         backend_cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
         if (backend_cpu == nullptr) {
@@ -511,7 +533,7 @@ llama_context::llama_context(
         }
         backends.emplace_back(backend_cpu);
 
-        // create a list of the set_n_threads functions in the backends
+        // create a list of the set_n_threads and copy_range functions in the backends
         for (auto & backend : backends) {
             ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
             ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
@@ -519,6 +541,10 @@ llama_context::llama_context(
                 auto ggml_backend_set_n_threads_fn = (ggml_backend_set_n_threads_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads");
                 if (ggml_backend_set_n_threads_fn) {
                     set_n_threads_fns.emplace_back(backend.get(), ggml_backend_set_n_threads_fn);
+                }
+                auto ggml_backend_tensor_copy_range_fn = (ggml_backend_tensor_copy_range_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_tensor_copy_range");
+                if (ggml_backend_tensor_copy_range_fn) {
+                    copy_range_fns.emplace_back(backend.get(), ggml_backend_tensor_copy_range_fn);
                 }
             }
         }
@@ -3142,6 +3168,28 @@ ggml_status llama_context::graph_compute(
 bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data) {
     auto * lctx = static_cast<llama_context *>(user_data);
 
+    // a weight in device memory can only be copied by the backend
+    const bool src_host = ggml_backend_buffer_is_host(src->buffer);
+    ggml_backend_tensor_copy_range_t copy_range_fn = nullptr;
+    if (!src_host) {
+        for (const auto & fn : lctx->copy_range_fns) {
+            if (fn.first == backend) {
+                copy_range_fn = fn.second;
+            }
+        }
+        if (copy_range_fn == nullptr || !copy_range_fn(backend, src, dst, 0, 0)) {
+            return false;
+        }
+    }
+
+    auto copy_range = [&](size_t offset, size_t size) {
+        if (src_host) {
+            ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + offset, offset, size);
+        } else {
+            copy_range_fn(backend, src, dst, offset, size);
+        }
+    };
+
     // the slot maps of the MoE cache
     if (lctx->moe_cache && lctx->moe_cache->copy(backend, src, dst, graph)) {
         return true;
@@ -3203,7 +3251,7 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
                 continue;
             }
             if (next < e) {
-                ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + next*expert_size, next*expert_size, (e - next)*expert_size);
+                copy_range(next*expert_size, (e - next)*expert_size);
             }
             e   += n;
             next = e;
@@ -3214,7 +3262,7 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
         const size_t padding = last < n_expert - 1 ? std::min<size_t>(expert_size, 512) : 0;
         const size_t size    = (last + 1 - next)*expert_size + padding;
         if (size > 0) {
-            ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + offset, offset, size);
+            copy_range(offset, size);
         }
 
         first = last + 1;

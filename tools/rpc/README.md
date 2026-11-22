@@ -83,6 +83,22 @@ $ llama-cli -hf ggml-org/gemma-3-1b-it-GGUF -ngl 99 --rpc 192.168.88.10:50052,19
 By default, llama.cpp distributes model weights and the KV cache across all available devices -- both local and remote -- in proportion to each device's available memory.
 You can override this behavior with the `--tensor-split` option and set custom proportions when splitting tensor data across devices.
 
+### Host memory
+
+When a MoE model does not fit in the memory of the remote devices, the main host normally keeps the remaining expert weights in its own RAM and computes them on its own CPU.
+The `ggml-rpc-server` can keep these weights in its RAM instead. The remote device then computes all layers at every batch size: for each batch, the server copies only the experts that the batch uses from its RAM to the device.
+
+By default, the server offers all of its free RAM for this, unless one of its devices uses the system RAM (CPU device, integrated GPU, Metal). Use `--host-mem` to set a limit in MiB, `--host-mem 0` turns it off:
+
+```bash
+$ bin/ggml-rpc-server --host-mem 32768
+```
+
+No option is needed on the main host. The automatic fitting of the model (`--fit`, on by default) uses the RAM of the server when all expert weights of the model fit in it, otherwise it uses the RAM of the main host as before. With `--moe-cache-mib`, the expert weights always stay in the RAM of the main host.
+Token generation can be slower than with the experts on a fast CPU of the main host, because the used experts are copied to the device for every token.
+
+The `-m` option only caps the device memory that the server reports, it does not limit the RAM.
+
 ### Local cache
 
 The RPC server can use a local cache to store large tensors and avoid transferring them over the network.

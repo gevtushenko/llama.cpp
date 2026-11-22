@@ -234,6 +234,8 @@ extern "C" {
     typedef ggml_backend_buffer_type_t * (*ggml_backend_dev_get_extra_bufts_t)(ggml_backend_dev_t device);
     // Set the abort callback for the backend
     typedef void                         (*ggml_backend_set_abort_callback_t)(ggml_backend_t backend, ggml_abort_callback abort_callback, void * abort_callback_data);
+    // Copy a range of a tensor in remote host memory to a tensor of the backend, size 0 = only check support
+    typedef bool                         (*ggml_backend_tensor_copy_range_t)(ggml_backend_t backend, const struct ggml_tensor * src, struct ggml_tensor * dst, size_t offset, size_t size);
     // Get a list of feature flags supported by the backend (returns a NULL-terminated array)
     struct ggml_backend_feature {
         const char * name;
@@ -334,7 +336,7 @@ extern "C" {
 
     // Callback while copying input weights of a split
     // if the user returns false the scheduler simply copies the entire weight
-    // the callback is called only for input weights in host buffers
+    // `src->data` can be read only if the buffer of `src` is a host buffer
     // the callback is called after all non-weight inputs of the split have been copied
     // `src` is the tensor in the previous split
     // `dst` is the copy of `src` in the split

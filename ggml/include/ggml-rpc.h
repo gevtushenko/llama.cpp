@@ -8,7 +8,7 @@ extern "C" {
 
 #define RPC_PROTO_MAJOR_VERSION    10
 #define RPC_PROTO_MINOR_VERSION    0
-#define RPC_PROTO_PATCH_VERSION    1
+#define RPC_PROTO_PATCH_VERSION    2
 
 #ifdef  __cplusplus
 static_assert(GGML_OP_COUNT == 100, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
@@ -28,13 +28,15 @@ GGML_BACKEND_API void ggml_backend_rpc_get_device_memory(const char * endpoint, 
 // dev_mem_caps is an optional array of length n_devices specifying a per-device
 // cap (in bytes) on the free/total memory reported to clients. A cap of 0 means
 // "no cap" for that device. Pass nullptr to disable capping entirely.
+// host_mem: bytes of host memory that clients can use for weights, 0 = off
 GGML_BACKEND_API void ggml_backend_rpc_start_server(
         const char * endpoint,
         const char * cache_dir,
         size_t n_threads,
         size_t n_devices,
         ggml_backend_dev_t * devices,
-        const size_t * dev_mem_caps);
+        const size_t * dev_mem_caps,
+        size_t host_mem);
 
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_rpc_reg(void);
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_rpc_add_server(const char * endpoint);

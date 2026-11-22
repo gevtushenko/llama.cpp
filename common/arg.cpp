@@ -236,6 +236,14 @@ static void parse_tensor_buffer_overrides(const std::string & value, std::vector
         if (buft) {
             buft_list[ggml_backend_buft_name(buft)] = buft;
         }
+        // the host memory of an RPC server is not in the device list
+        typedef ggml_backend_buffer_type_t (*host_buft_fn_t)(ggml_backend_dev_t);
+        auto * reg = ggml_backend_dev_backend_reg(dev);
+        auto host_buft_fn = reg ? (host_buft_fn_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_dev_host_buffer_type") : nullptr;
+        auto * host_buft = host_buft_fn ? host_buft_fn(dev) : nullptr;
+        if (host_buft) {
+            buft_list[ggml_backend_buft_name(host_buft)] = host_buft;
+        }
     }
 
     for (const auto & override : string_split<std::string>(value, ',')) {

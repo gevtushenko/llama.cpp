@@ -7,6 +7,7 @@
 
 #include "../src/llama-ext.h"
 
+#include <algorithm>
 #include <array>
 #include <cassert>
 #include <stdexcept>
@@ -631,6 +632,9 @@ static void common_params_fit_impl(
 
     const size_t ntbo = llama_max_tensor_buft_overrides();
 
+    // where the MoE tensors that do not fit in the memory of a device go, system memory by default
+    std::vector<ggml_backend_buffer_type_t> moe_bufts(nd, ggml_backend_cpu_buffer_type());
+
     // utility function to set n_gpu_layers and tensor_split
     auto set_ngl_tensor_split_tbo = [&](
             const std::vector<ngl_t> & ngl_per_device,
@@ -675,7 +679,7 @@ static void common_params_fit_impl(
                         + std::to_string(ntbo) + " is insufficient for model");
                 }
                 tensor_buft_overrides[itbo].pattern = get_overflow_pattern(il, il == il0 ? ngl_per_device[id].overflow_type : LAYER_FRACTION_MOE);
-                tensor_buft_overrides[itbo].buft = il == il0 ? overflow_bufts[id] : ggml_backend_cpu_buffer_type();
+                tensor_buft_overrides[itbo].buft = il == il0 ? overflow_bufts[id] : moe_bufts[id];
                 itbo++;
             }
             il0 += ngl_per_device[id].n_part;
@@ -743,6 +747,44 @@ static void common_params_fit_impl(
         // reset
         tensor_buft_overrides[0] = {nullptr, nullptr};
         mparams->tensor_buft_overrides = tensor_buft_overrides;
+
+        // the MoE tensors are what left the devices, the host row has no tensors in extra CPU bufts (e.g. CPU_REPACK)
+        int64_t moe_size = 0;
+        for (size_t id = 0; id < nd; id++) {
+            moe_size += int64_t(dmds_full[id].mb.model) - int64_t(dmds_cpu_moe[id].mb.model);
+        }
+
+        // the context has one more backend for each server with weights in its host memory
+        size_t n_backends = nd + 1;
+        for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+            if (ggml_backend_dev_type(ggml_backend_dev_get(i)) == GGML_BACKEND_DEVICE_TYPE_ACCEL) {
+                n_backends++;
+            }
+        }
+
+        // a remote device can keep the MoE tensors in the host memory of its server, the MoE cache needs them in system memory
+        for (int id = nd - 1; id >= 0 && cparams->moe_cache_size == 0; id--) {
+            typedef ggml_backend_buffer_type_t (*host_buft_fn_t)(ggml_backend_dev_t);
+            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(devs[id]);
+            auto host_buft_fn = reg ? (host_buft_fn_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_dev_host_buffer_type") : nullptr;
+            ggml_backend_buffer_type_t host_buft = host_buft_fn ? host_buft_fn(devs[id]) : nullptr;
+            if (host_buft == nullptr) {
+                continue;
+            }
+            const bool seen = std::find(moe_bufts.begin(), moe_bufts.end(), host_buft) != moe_bufts.end();
+            size_t free;
+            size_t total;
+            ggml_backend_dev_memory(ggml_backend_buft_get_device(host_buft), &free, &total);
+            const bool use = int64_t(free) >= moe_size && (seen || n_backends < llama_max_devices());
+            LOG_TRC("%s: %s has %" PRId64 " MiB free for %" PRId64 " MiB of MoE tensors -> %s\n",
+                __func__, ggml_backend_buft_name(host_buft), int64_t(free)/MiB, moe_size/MiB, use ? "used instead of system memory" : "not used");
+            if (use) {
+                if (!seen) {
+                    n_backends++;
+                }
+                moe_bufts[id] = host_buft;
+            }
+        }
     }
 
     std::vector<int64_t> targets; // maximum acceptable memory use per device
@@ -755,7 +797,7 @@ static void common_params_fit_impl(
     std::vector<ggml_backend_buffer_type_t> overflow_bufts; // which bufts the first partial layer of a device overflows to:
     overflow_bufts.reserve(nd);
     for (size_t id = 0; id < nd; id++) {
-        overflow_bufts.push_back(ggml_backend_cpu_buffer_type());
+        overflow_bufts.push_back(moe_bufts[id]);
     }
 
     std::vector<ngl_t> ngl_per_device(nd);

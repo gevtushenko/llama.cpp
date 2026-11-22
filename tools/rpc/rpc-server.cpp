@@ -83,6 +83,9 @@ struct rpc_server_params {
     std::vector<std::string> devices;
     // per-device cap (in bytes) on reported free/total memory; 0 = uncapped
     std::vector<size_t>      dev_mem;
+    // host memory (in bytes) that clients can use for weights; 0 = off
+    size_t                   host_mem    = 0;
+    bool                     host_mem_set = false;
 };
 
 static void print_usage(int /*argc*/, char ** argv, rpc_server_params params) {
@@ -94,6 +97,7 @@ static void print_usage(int /*argc*/, char ** argv, rpc_server_params params) {
     fprintf(stderr, "  -H, --host HOST                  host to bind to (default: %s)\n", params.host.c_str());
     fprintf(stderr, "  -p, --port PORT                  port to bind to (default: %d)\n", params.port);
     fprintf(stderr, "  -m, --mem <M1,M2,...>            cap reported memory for each device (in MiB)\n");
+    fprintf(stderr, "      --host-mem N                 host memory that clients can use for weights (in MiB, 0 = off, default: all, or off if a device uses host memory)\n");
     fprintf(stderr, "  -c, --cache                      enable local file cache\n");
     fprintf(stderr, "\n");
 }
@@ -158,6 +162,17 @@ static bool rpc_server_params_parse(int argc, char ** argv, rpc_server_params & 
                     fprintf(stderr, "error: invalid memory size: %s\n", iter->str().c_str());
                     return false;
                 }
+            }
+        } else if (arg == "--host-mem") {
+            if (++i >= argc) {
+                return false;
+            }
+            try {
+                params.host_mem = std::stoull(argv[i]) * 1024 * 1024;
+                params.host_mem_set = true;
+            } catch (const std::exception & ) {
+                fprintf(stderr, "error: invalid memory size: %s\n", argv[i]);
+                return false;
             }
         } else if (arg == "-h" || arg == "--help") {
             print_usage(argc, argv, params);
@@ -240,6 +255,22 @@ int main(int argc, char * argv[]) {
         fprintf(stderr, "No devices found\n");
         return 1;
     }
+    if (!params.host_mem_set) {
+        // all free host memory by default
+        ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        if (cpu_dev) {
+            size_t total;
+            ggml_backend_dev_memory(cpu_dev, &params.host_mem, &total);
+        }
+        // the memory of these devices is host memory, do not offer it twice
+        for (ggml_backend_dev_t dev : devices) {
+            const enum ggml_backend_dev_type type = ggml_backend_dev_type(dev);
+            if (type == GGML_BACKEND_DEVICE_TYPE_CPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU ||
+                    ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)) == std::string("MTL")) {
+                params.host_mem = 0;
+            }
+        }
+    }
     std::string endpoint = params.host + ":" + std::to_string(params.port);
     const char * cache_dir = nullptr;
     std::string cache_dir_str;
@@ -272,6 +303,6 @@ int main(int argc, char * argv[]) {
         dev_mem_caps[i] = params.dev_mem[i];
     }
     const size_t * dev_mem_caps_ptr = params.dev_mem.empty() ? nullptr : dev_mem_caps.data();
-    start_server_fn(endpoint.c_str(), cache_dir, params.n_threads, devices.size(), devices.data(), dev_mem_caps_ptr);
+    start_server_fn(endpoint.c_str(), cache_dir, params.n_threads, devices.size(), devices.data(), dev_mem_caps_ptr, params.host_mem);
     return 0;
 }
