@@ -2328,7 +2328,10 @@ bool rpc_server::copy_tensor_range(const rpc_msg_copy_tensor_range_req & request
              rpc_log_format_tensor(dst).c_str(), request.offset, rpc_log_format_size(request.size).c_str());
 
     // dst is a temporary copy of a weight, the backend must clear its padding like in a compute buffer
-    ggml_backend_buffer_set_usage(dst->buffer, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+    // a view is a part of a persistent tensor (MoE cache), its buffer keeps its usage
+    if (request.dst.view_src == 0) {
+        ggml_backend_buffer_set_usage(dst->buffer, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+    }
 
     // no synchronization, the copy is ordered with the graphs of the device
     ggml_backend_tensor_set_async(backend, dst, (const char *) src->data + request.offset, request.offset, request.size);

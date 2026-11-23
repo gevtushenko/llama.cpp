@@ -326,6 +326,10 @@ struct llama_moe_cache::impl {
         size_t host_bytes = 0; // host experts of the layers it caches
         double split = 0.0;    // share of the budget
 
+        // a remote device can keep the host experts in the host memory of its server and copy them from there
+        ggml_backend_buffer_type_t       buft_remote = nullptr;
+        ggml_backend_tensor_copy_range_t copy_range  = nullptr;
+
         // banks and their views
         ggml_context_ptr ctx;
         ggml_backend_buffer_ptr buf;
@@ -335,6 +339,7 @@ struct llama_moe_cache::impl {
     // layers of the same device with the same expert tensor layout share the banks and the LRU of a group
     struct group {
         int32_t id;                       // device
+        bool remote = false;              // the host experts are in the host memory of the server of the device
         std::vector<ggml_tensor *> ref;   // expert tensors of the first layer
         std::vector<int32_t> layers;
         std::vector<ggml_tensor *> banks; // device storage of all slots, one per expert tensor
@@ -407,6 +412,15 @@ struct llama_moe_cache::impl {
                 auto & d = devices.emplace_back();
                 d.backend = backends[i];
                 d.buft    = bufts[i];
+
+                typedef ggml_backend_buffer_type_t (*host_buft_fn_t)(ggml_backend_dev_t);
+                ggml_backend_dev_t dev = ggml_backend_get_device(backends[i]);
+                ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+                auto host_buft_fn = reg ? (host_buft_fn_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_dev_host_buffer_type") : nullptr;
+                d.copy_range = reg ? (ggml_backend_tensor_copy_range_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_tensor_copy_range") : nullptr;
+                if (host_buft_fn && d.copy_range) {
+                    d.buft_remote = host_buft_fn(dev);
+                }
             }
         }
         if (devices.empty()) {
@@ -422,20 +436,29 @@ struct llama_moe_cache::impl {
         // only cache layers that keep all of their experts in host memory, on the device the layer is assigned to
         for (size_t il = 0; il < model.layers.size(); ++il) {
             auto experts = llama_moe_cache_layer_experts(model.layers[il]);
-            if (experts.empty() || !std::all_of(experts.begin(), experts.end(), llama_moe_cache_is_host_weight)) {
+            if (experts.empty()) {
                 continue;
             }
             const auto it_dev = std::find_if(devices.begin(), devices.end(), [&](const device & d) { return ggml_backend_get_device(d.backend) == model.dev_layer(il); });
             if (it_dev == devices.end()) {
                 continue;
             }
+            const bool remote = it_dev->buft_remote != nullptr && std::all_of(experts.begin(), experts.end(), [&](const ggml_tensor * t) {
+                return t->buffer != nullptr &&
+                    ggml_backend_buffer_get_usage(t->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+                    ggml_backend_buffer_get_type(t->buffer) == it_dev->buft_remote;
+            });
+            if (!remote && !std::all_of(experts.begin(), experts.end(), llama_moe_cache_is_host_weight)) {
+                continue;
+            }
             const int32_t id = (int32_t) (it_dev - devices.begin());
-            auto it = std::find_if(groups.begin(), groups.end(), [&](const group & g) { return g.id == id && llama_moe_cache_same_layout(g.ref, experts); });
+            auto it = std::find_if(groups.begin(), groups.end(), [&](const group & g) { return g.id == id && g.remote == remote && llama_moe_cache_same_layout(g.ref, experts); });
             if (it == groups.end()) {
                 groups.emplace_back();
                 it = groups.end() - 1;
-                it->id  = id;
-                it->ref = experts;
+                it->id     = id;
+                it->remote = remote;
+                it->ref    = experts;
             }
             it->layers.push_back(il);
             for (const ggml_tensor * t : experts) {
@@ -516,7 +539,7 @@ struct llama_moe_cache::impl {
             }
             g.lru.init(model.layers.size(), n_expert, g.n_slots);
             n_tensors[g.id] += g.ref.size()*(1 + g.layers.size());
-            n_tensors_host  += g.layers.size()*(n_zero > 0 ? 3 : 1); // slot maps and CPU map
+            n_tensors_host  += g.layers.size()*(n_zero > 0 && !g.remote ? 3 : 1); // slot maps and CPU map
         }
         if (n_tensors_host == 0) {
             throw std::runtime_error("MoE cache is too small to hold the experts of one token");
@@ -571,7 +594,7 @@ struct llama_moe_cache::impl {
                 ggml_format_name(l.slot_map, "moe_cache.slot_map-%d", il);
                 layer_of[l.slot_map] = { il, false };
                 buf_host_size += GGML_PAD(ggml_nbytes(l.slot_map), alignment_host);
-                if (n_zero > 0) {
+                if (n_zero > 0 && !g.remote) { // the CPU cannot read the experts in the host memory of a server
                     l.slot_map_cpu = ggml_new_tensor_2d(ctx_host.get(), GGML_TYPE_I32, 1, g.ref[0]->ne[2]);
                     ggml_format_name(l.slot_map_cpu, "moe_cache.slot_map_cpu-%d", il);
                     layer_of[l.slot_map_cpu] = { il, true };
@@ -843,7 +866,19 @@ struct llama_moe_cache::impl {
                 while (i + n < fills.size() && fills[i + n].expert == fills[i].expert + (int32_t) n && fills[i + n].slot == fills[i].slot + (int32_t) n) {
                     n++;
                 }
-                ggml_backend_tensor_set_async(backend, bank, (const uint8_t *) w->data + fills[i].expert*expert_size, fills[i].slot*expert_size, n*expert_size);
+                if (g.remote) {
+                    // the server copies the experts from its host memory
+                    ggml_reset(ctx_views.get());
+                    ggml_tensor * src_view = ggml_view_3d(ctx_views.get(), const_cast<ggml_tensor *>(w), w->ne[0], w->ne[1], n, w->nb[1], w->nb[2], fills[i].expert*expert_size);
+                    ggml_tensor * dst_view = ggml_view_3d(ctx_views.get(), bank, bank->ne[0], bank->ne[1], n, bank->nb[1], bank->nb[2], fills[i].slot*expert_size);
+                    ggml_backend_view_init(src_view);
+                    ggml_backend_view_init(dst_view);
+                    if (!devices[g.id].copy_range(backend, src_view, dst_view, 0, n*expert_size)) {
+                        GGML_ABORT("failed to copy the experts of layer %d from the host memory of the server", il);
+                    }
+                } else {
+                    ggml_backend_tensor_set_async(backend, bank, (const uint8_t *) w->data + fills[i].expert*expert_size, fills[i].slot*expert_size, n*expert_size);
+                }
                 bytes += n*expert_size;
                 i += n;
             }

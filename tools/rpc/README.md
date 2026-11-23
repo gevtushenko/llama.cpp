@@ -94,7 +94,7 @@ By default, the server offers all of its free RAM for this, unless one of its de
 $ bin/ggml-rpc-server --host-mem 32768
 ```
 
-No option is needed on the main host. The automatic fitting of the model (`--fit`, on by default) uses the RAM of the server when all expert weights of the model fit in it, otherwise it uses the RAM of the main host as before. With `--moe-cache-mib`, the expert weights always stay in the RAM of the main host.
+No option is needed on the main host. The automatic fitting of the model (`--fit`, on by default) gives a remote device as many layers as the RAM of its server has room for expert weights, the remaining expert weights stay in the RAM of the main host as before. With `--moe-cache-mib`, the remote device keeps the recently used experts in its memory, the server then only copies the missing experts from its RAM.
 Token generation can be slower than with the experts on a fast CPU of the main host, because the used experts are copied to the device for every token.
 
 The `-m` option only caps the device memory that the server reports, it does not limit the RAM.
